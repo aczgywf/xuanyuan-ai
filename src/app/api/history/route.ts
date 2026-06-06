@@ -1,10 +1,11 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { query } from "@/lib/db";
+import { query, ensureTables } from "@/lib/db";
 
 export async function GET(req: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "未登录" }, { status: 401 });
+  await ensureTables();
 
   const url = new URL(req.url);
   const conversationId = url.searchParams.get("conversationId");
