@@ -1,19 +1,22 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
-import { sql } from "@vercel/postgres";
-import { checkAndDeductCredit } from "@/lib/credits"
-import { cuid } from "@/lib/db";
 import OpenAI from "openai";
 
+function cuid(): string { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
 const deepseek = new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY || "dummy", baseURL: "https://api.deepseek.com/v1" });
 
 export async function POST(req: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "未登录" }, { status: 401 });
-
   const userId = session.user.id;
-  const creditResult = await checkAndDeductCredit(userId);
-  if (!creditResult.success) return NextResponse.json({ error: "积分不足" }, { status: 402 });
+
+  const { sql } = await import("@vercel/postgres");
+
+  // Check and deduct credit
+  const user = await sql`SELECT credits FROM users WHERE id = ${userId}`;
+  if (user.rows.length === 0 || user.rows[0].credits < 1) return NextResponse.json({ error: "积分不足" }, { status: 402 });
+  const updated = await sql`UPDATE users SET credits = credits - 1 WHERE id = ${userId} RETURNING credits`;
+  const remaining = updated.rows[0].credits;
 
   try {
     const { message, conversationId } = await req.json();
@@ -45,8 +48,6 @@ export async function POST(req: Request) {
     await sql`INSERT INTO messages (id, conversation_id, role, content) VALUES (${cuid()}, ${conversation.id}, 'assistant', ${reply})`;
     await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversation.id}`;
 
-    return NextResponse.json({ reply, conversationId: conversation.id, remaining: creditResult.remaining });
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message || "对话失败" }, { status: 500 });
-  }
+    return NextResponse.json({ reply, conversationId: conversation.id, remaining });
+  } catch (error: any) { return NextResponse.json({ error: error.message || "对话失败" }, { status: 500 }); }
 }
