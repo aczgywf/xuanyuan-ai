@@ -1,42 +1,37 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { query, cuid, ensureTables } from "@/lib/db";
+import { checkAndDeductCredit } from "@/lib/credits";
 import OpenAI from "openai";
 
-function cuid(): string { return Date.now().toString(36) + Math.random().toString(36).slice(2); }
 const deepseek = new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY || "dummy", baseURL: "https://api.deepseek.com/v1" });
 
 export async function POST(req: Request) {
   const session = await auth();
   if (!session?.user?.id) return NextResponse.json({ error: "未登录" }, { status: 401 });
+  await ensureTables();
   const userId = session.user.id;
-
-  const { sql } = await import("@vercel/postgres");
-
-  // Check and deduct credit
-  const user = await sql`SELECT credits FROM users WHERE id = ${userId}`;
-  if (user.rows.length === 0 || user.rows[0].credits < 1) return NextResponse.json({ error: "积分不足" }, { status: 402 });
-  const updated = await sql`UPDATE users SET credits = credits - 1 WHERE id = ${userId} RETURNING credits`;
-  const remaining = updated.rows[0].credits;
+  const creditResult = await checkAndDeductCredit(userId);
+  if (!creditResult.success) return NextResponse.json({ error: "积分不足" }, { status: 402 });
 
   try {
     const { message, conversationId } = await req.json();
     if (!message) return NextResponse.json({ error: "消息不能为空" }, { status: 400 });
 
-    let conversation: any;
-    if (conversationId) {
-      const rows = await sql`SELECT * FROM conversations WHERE id = ${conversationId} AND user_id = ${userId}`;
-      conversation = rows.rows[0];
+    let convId = conversationId;
+    let exists = false;
+    if (convId) {
+      const r = await query("SELECT id FROM conversations WHERE id = $1 AND user_id = $2", [convId, userId]);
+      exists = r.rows.length > 0;
+    }
+    if (!exists) {
+      convId = cuid();
+      await query("INSERT INTO conversations (id, user_id, title) VALUES ($1, $2, $3)", [convId, userId, message.slice(0, 30)]);
     }
 
-    if (!conversation) {
-      const newId = cuid();
-      await sql`INSERT INTO conversations (id, user_id, title) VALUES (${newId}, ${userId}, ${message.slice(0, 30)})`;
-      conversation = { id: newId };
-    }
+    await query("INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'user', $3)", [cuid(), convId, message]);
 
-    await sql`INSERT INTO messages (id, conversation_id, role, content) VALUES (${cuid()}, ${conversation.id}, 'user', ${message})`;
-
-    const history = await sql`SELECT role, content FROM messages WHERE conversation_id = ${conversation.id} ORDER BY created_at ASC`;
+    const history = await query("SELECT role, content FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC", [convId]);
 
     const completion = await deepseek.chat.completions.create({
       model: "deepseek-chat",
@@ -45,9 +40,9 @@ export async function POST(req: Request) {
     });
 
     const reply = completion.choices[0]?.message?.content || "抱歉，我无法回复。";
-    await sql`INSERT INTO messages (id, conversation_id, role, content) VALUES (${cuid()}, ${conversation.id}, 'assistant', ${reply})`;
-    await sql`UPDATE conversations SET updated_at = NOW() WHERE id = ${conversation.id}`;
+    await query("INSERT INTO messages (id, conversation_id, role, content) VALUES ($1, $2, 'assistant', $3)", [cuid(), convId, reply]);
+    await query("UPDATE conversations SET updated_at = NOW() WHERE id = $1", [convId]);
 
-    return NextResponse.json({ reply, conversationId: conversation.id, remaining });
+    return NextResponse.json({ reply, conversationId: convId, remaining: creditResult.remaining });
   } catch (error: any) { return NextResponse.json({ error: error.message || "对话失败" }, { status: 500 }); }
 }
